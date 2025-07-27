@@ -6,7 +6,10 @@ import logging
 import os
 from datetime import datetime
 from pathlib import Path
+import base64
 from typing import Dict, Optional
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -37,7 +40,8 @@ class GremlinParser:
         """
         mappings = {}
         try:
-            tree = ET.parse(self.xml_file)
+            with open(self.xml_file, 'r', encoding='utf-8-sig') as f:
+                tree = ET.parse(f)
             root = tree.getroot()
 
             for element in root.iter():
@@ -126,26 +130,87 @@ class SvgTemplate:
         else:
             logging.warning("No replacements were made in the SVG file.")
 
+    def _get_driver(self):
+        """Configure and return a headless Chrome webdriver."""
+        chrome_options = Options()
+        chrome_options.add_argument("--headless")
+        chrome_options.add_argument("--disable-gpu")
+        chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--disable-dev-shm-usage")
+        driver = webdriver.Chrome(options=chrome_options)
+        return driver
 
-    def save(self, output_path: Path):
+    def save_pdf(self, output_path: Path):
         """
-        Saves the modified SVG data to a new file.
+        Saves the modified SVG data to a new PDF file using a headless browser.
 
-        :param output_path: The path to save the new SVG file.
+        :param output_path: The path to save the new PDF file.
         """
-        with open(output_path, 'w', encoding='utf-8') as f:
-            f.write(self.raw_data)
-        print(f"Successfully updated SVG and saved to {output_path}")
+        driver = self._get_driver()
+        temp_svg_path = None
+        try:
+            # Use a temporary file to render the SVG
+            temp_svg_path = output_path.with_suffix('.temp.svg')
+            with open(temp_svg_path, 'w', encoding='utf-8') as f:
+                f.write(self.raw_data)
+
+            driver.get(f"file:///{temp_svg_path.resolve()}")
+
+            # Get the exact dimensions of the SVG element
+            dimensions = driver.execute_script(
+                "const svg = document.querySelector('svg');"
+                "if (svg) {"
+                "    const width = svg.getAttribute('width');"
+                "    const height = svg.getAttribute('height');"
+                "    return {width: parseFloat(width), height: parseFloat(height)};"
+                "} else { return null; }"
+            )
+
+            if not dimensions or not dimensions.get('width') or not dimensions.get('height'):
+                raise Exception("Could not determine SVG dimensions.")
+
+            # Convert pixel dimensions to inches for printing (assuming 96 DPI)
+            dpi = 96
+            paper_width = dimensions['width'] / dpi
+            paper_height = dimensions['height'] / dpi
+            
+            # Use Chrome's DevTools Protocol to print to PDF in landscape
+            print_settings = {
+                "landscape": True,
+                "printBackground": True,
+                "marginTop": 0,
+                "marginBottom": 0,
+                "marginLeft": 0,
+                "marginRight": 0,
+                "pageRanges": "1",
+            }
+            result = driver.execute_cdp_cmd("Page.printToPDF", print_settings)
+            pdf_data = base64.b64decode(result['data'])
+            
+            with open(output_path, 'wb') as f:
+                f.write(pdf_data)
+
+            print(f"Successfully converted SVG to PDF and saved to {output_path}")
+        finally:
+            driver.quit()
+            if temp_svg_path and temp_svg_path.exists():
+                os.remove(temp_svg_path)
 
 
 def main():
-    if len(sys.argv) != 3:
-        print("Usage: python diagram_generator.py <gremlin_xml_file> <svg_template_file>")
+    if len(sys.argv) not in [3, 4]:
+        print("Usage: python diagram_generator.py <gremlin_xml_file> <svg_template_file> [output_dir]")
         sys.exit(1)
 
     xml_file = Path(sys.argv[1])
     svg_file = Path(sys.argv[2])
-    output_svg_file = xml_file.with_suffix('.svg')
+    
+    output_dir = Path('.')
+    if len(sys.argv) == 4:
+        output_dir = Path(sys.argv[3])
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+    output_file = output_dir / xml_file.with_suffix('.pdf').name
 
     parser = GremlinParser(xml_file)
     mappings = parser.mappings
@@ -154,9 +219,12 @@ def main():
         try:
             template = SvgTemplate(svg_file)
             template.replace_fields(mappings, str(xml_file))
-            template.save(output_svg_file)
+            template.save_pdf(output_file)
+
         except FileNotFoundError:
             logging.error(f"Error: SVG file not found at {svg_file}")
+        except Exception as e:
+            logging.error(f"An error occurred during file generation: {e}")
 
 
 if __name__ == "__main__":
